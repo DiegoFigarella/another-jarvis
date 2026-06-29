@@ -1,3 +1,5 @@
+.wav
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -156,7 +158,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-
+.env.*
+!.env.example
 # Spyder project settings
 .spyderproject
 .spyproject

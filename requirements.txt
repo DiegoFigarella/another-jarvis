@@ -1,0 +1,11 @@
+sounddevice
+clap-detector
+evolutionapi
+langchain
+pygame
+dotenv
+numpy
+google-cloud-speech
+langchain-google-genai
+langchain-anthropic
+requests

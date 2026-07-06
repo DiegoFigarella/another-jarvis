@@ -4,24 +4,25 @@ import os
 import queue
 import threading
 from enum import Enum, auto
-from typing import Generator
 
+import numpy as np
+import pyaudio
 import pygame
-import sounddevice as sd
-from clapDetector import ClapDetector, printDeviceInfo
+from clapDetector import ClapDetector
 from dotenv import load_dotenv
-from google.cloud import speech
 
 load_dotenv()
+
+from whisper_stt import WhisperCpp, stream_transcribe  # noqa: E402  (needs .env loaded first)
 
 # ── Audio config ──────────────────────────────────────────────────────────────
 THRESHOLD_BIAS: int = 8000
 LOWCUT: int = 1000
 HIGHCUT: int = 10000
-SAMPLE_RATE: int = 48000          # you may adjust this to your microphone's sample rate
-CHUNK_FRAMES: int = 1024          # frames per sounddevice callback
-STT_CHUNK_MS: int = 500           # ms of audio per streaming-STT request chunk
-STT_CHUNK_FRAMES: int = int(SAMPLE_RATE * STT_CHUNK_MS / 1000)
+CHUNK_FRAMES: int = 1024          # frames per audio buffer read
+STT_CHUNK_MS: int = 500           # ms of audio per chunk handed to the STT thread
+# Device, channel count, and sample rate are taken from the system default mic
+# at startup, so plugging in earbuds just works.
 
 
 class State(Enum):
@@ -29,82 +30,45 @@ class State(Enum):
     LISTENING = auto()
 
 
-# ── Google Streaming STT ──────────────────────────────────────────────────────
+# ── Device selection ──────────────────────────────────────────────────────────
 
-def _build_stt_client() -> speech.SpeechClient:
-    return speech.SpeechClient()
+def pick_input_device() -> int:
+    """Return PyAudio's default input device, or the first device that can record.
 
-
-def _make_streaming_config() -> speech.StreamingRecognitionConfig:
-    recognition_config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-        sample_rate_hertz=SAMPLE_RATE,
-        language_code="en-US", # feel free to change this to your preferred language code but english produces the best results for me
-        enable_automatic_punctuation=True,
-        speech_contexts=[
-            speech.SpeechContext(
-                phrases=[
-                    "WhatsApp",
-                    "send a text message to", 
-                ],
-                boost=20.0,
-            )
-        ]
-    )
-    return speech.StreamingRecognitionConfig(
-        config=recognition_config,
-        interim_results=True,
-    )
-
-
-def _audio_generator(
-    audio_q: queue.Queue[bytes | None],
-) -> Generator[bytes, None, None]:
-    """Yield raw PCM bytes from the queue until the None sentinel."""
-    while True:
-        chunk = audio_q.get()
-        if chunk is None:
-            return
-        yield chunk
-
-
-def stream_transcribe(
-    audio_q: queue.Queue[bytes | None],
-    stt_client: speech.SpeechClient,
-) -> None:
+    PyAudio sometimes reports no default input on Windows even when mics exist
+    under other host APIs (WASAPI etc.), so we scan everything ourselves.
     """
-    Runs in its own thread. Reads audio bytes from *audio_q*, streams them
-    to Google STT, and prints interim / final transcripts as they arrive.
-    Exits when it receives the None sentinel from the queue.
-    """
-    streaming_config = _make_streaming_config()
-
+    p = pyaudio.PyAudio()
     try:
-        responses = stt_client.streaming_recognize(
-            config=streaming_config,
-            requests=(
-                speech.StreamingRecognizeRequest(audio_content=chunk)
-                for chunk in _audio_generator(audio_q)
-            ),
-        )
-        for response in responses:
-            for result in response.results:
-                transcript = result.alternatives[0].transcript
-                tag = "[final]" if result.is_final else "[...]  "
-                print(f"\r{tag} {transcript}", end="", flush=True)
-                if result.is_final:
-                    print()
-    except Exception as exc:  # noqa: BLE001
-        print(f"\n[STT stream ended: {exc}]")
+        candidates: list[int] = []
+        print("Available input devices:")
+        for i in range(p.get_device_count()):
+            info = p.get_device_info_by_index(i)
+            if info["maxInputChannels"] > 0:
+                candidates.append(i)
+                print(f"  {i}: {info['name']} "
+                      f"({info['maxInputChannels']} ch @ {int(info['defaultSampleRate'])} Hz)")
+        try:
+            return p.get_default_input_device_info()["index"]
+        except OSError:
+            if candidates:
+                return candidates[0]
+            raise RuntimeError(
+                "No microphone found - connect/enable one in Windows sound settings"
+            ) from None
+    finally:
+        p.terminate()
 
 
 # ── Clap detection ────────────────────────────────────────────────────────────
 
-def detect_double_clap(detector: ClapDetector, audio: bytes) -> bool:
+def detect_double_clap(detector: ClapDetector, audio: np.ndarray) -> bool:
     result = detector.run(
         thresholdBias=THRESHOLD_BIAS,
         lowcut=LOWCUT,
-        highcut=HIGHCUT,
+        # clamp below Nyquist: bluetooth mics run at 8-16 kHz and scipy's
+        # bandpass filter throws if highcut >= rate/2
+        highcut=min(HIGHCUT, int(detector.rate * 0.45)),
         audioData=audio,
     )
     return len(result) == 2
@@ -114,18 +78,28 @@ def detect_double_clap(detector: ClapDetector, audio: bytes) -> bool:
 
 def main() -> None:
     pygame.mixer.init()
-    printDeviceInfo()
 
-    stt_client = _build_stt_client()
+    # INPUT_DEVICE env var (index or name substring) overrides auto-detection
+    device_env = os.getenv("INPUT_DEVICE", "").strip()
+    if device_env:
+        input_device = int(device_env) if device_env.lstrip("-").isdigit() else device_env
+    else:
+        input_device = pick_input_device()
+
+    whisper = WhisperCpp()
+    print("[whisper.cpp server ready]")
 
     detector = ClapDetector(
-        inputDevice=3,
+        inputDevice=input_device,
         logLevel=10,
         bufferLength=CHUNK_FRAMES,
         debounceTimeFactor=0.15,
-        rate=SAMPLE_RATE,
+        rate=None,                    # use the device's native rate
     )
     detector.initAudio()
+    sample_rate: int = detector.rate
+    channels: int = detector.p.get_device_info_by_index(detector.inputDevice)["maxInputChannels"]
+    stt_chunk_bytes: int = int(sample_rate * STT_CHUNK_MS / 1000) * 2  # int16 mono
 
     state = State.IDLE
 
@@ -139,17 +113,16 @@ def main() -> None:
     pcm_buffer: bytearray = bytearray()
 
     def flush_to_stt(buf: bytearray, force: bool = False) -> bytearray:
-        """Send complete STT_CHUNK_FRAMES-sized slices; return leftover bytes."""
-        chunk_bytes = STT_CHUNK_FRAMES * 2  # int16 = 2 bytes per frame
-        while len(buf) >= chunk_bytes or (force and buf):
-            audio_q.put(bytes(buf[:chunk_bytes]))
-            buf = buf[chunk_bytes:]
+        """Send complete STT-chunk-sized slices; return leftover bytes."""
+        while len(buf) >= stt_chunk_bytes or (force and buf):
+            audio_q.put(bytes(buf[:stt_chunk_bytes]))
+            buf = buf[stt_chunk_bytes:]
         return buf
 
     try:
         while True:
             # ClapDetector.getAudio() is a blocking call that yields one buffer
-            raw: bytes = detector.getAudio()
+            raw: np.ndarray = detector.getAudio()
 
             # ── Clap detection ─────────────────────────────────────────────
             if detect_double_clap(detector, raw):
@@ -174,7 +147,7 @@ def main() -> None:
                 pcm_buffer = bytearray()
                 stt_thread = threading.Thread(
                     target=stream_transcribe,
-                    args=(audio_q, stt_client),
+                    args=(audio_q, whisper, sample_rate),
                     daemon=True,
                 )
                 stt_thread.start()
@@ -182,8 +155,12 @@ def main() -> None:
                 continue
 
             # ── Forward audio to STT while listening ───────────────────────
+            # ponytail: wake song and STT run concurrently. Fine on headphones;
+            # on speakers the mic may transcribe the song's lyrics.
             if state is State.LISTENING:
-                pcm_buffer.extend(raw)
+                # downmix interleaved multi-channel capture to mono for whisper
+                mono = raw if channels == 1 else raw.reshape(-1, channels).mean(axis=1).astype(np.int16)
+                pcm_buffer.extend(mono.tobytes())
                 pcm_buffer = flush_to_stt(pcm_buffer)
 
     except KeyboardInterrupt:
@@ -194,6 +171,7 @@ def main() -> None:
             audio_q.put(None)
             if stt_thread is not None:
                 stt_thread.join()
+        whisper.close()
         detector.stop()
 
 

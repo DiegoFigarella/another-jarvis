@@ -119,7 +119,7 @@ if __name__ == "__main__":
     )
 
     result = jarvis.invoke({
-        "messages": [{ "role": "user", "content": "Get me a list of my contacts, please." }]
+        "messages": [{ "role": "user", "content": "Send a message to my dad (50769494863) saying 'hola papito'" }]
     })
 
     print(result)

@@ -1,11 +1,9 @@
-sounddevice
 clap-detector
 evolutionapi
 langchain
 pygame
+pyaudio
 dotenv
 numpy
-google-cloud-speech
-langchain-google-genai
 langchain-anthropic
 requests

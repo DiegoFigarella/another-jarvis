@@ -4,6 +4,8 @@ import os
 import queue
 import threading
 from enum import Enum, auto
+from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import pyaudio
@@ -13,7 +15,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from whisper_stt import WhisperCpp, stream_transcribe  # noqa: E402  (needs .env loaded first)
+from whisper_stt import create_transcriber, stream_transcribe  # noqa: E402  (needs .env loaded first)
 
 # ── Audio config ──────────────────────────────────────────────────────────────
 THRESHOLD_BIAS: int = 8000
@@ -21,6 +23,7 @@ LOWCUT: int = 1000
 HIGHCUT: int = 10000
 CHUNK_FRAMES: int = 1024          # frames per audio buffer read
 STT_CHUNK_MS: int = 500           # ms of audio per chunk handed to the STT thread
+WAKE_SOUND = Path(__file__).resolve().parent / "should_i_stay_or_should_i_go.mp3"
 # Device, channel count, and sample rate are taken from the system default mic
 # at startup, so plugging in earbuds just works.
 
@@ -32,32 +35,66 @@ class State(Enum):
 
 # ── Device selection ──────────────────────────────────────────────────────────
 
-def pick_input_device() -> int:
-    """Return PyAudio's default input device, or the first device that can record.
-
-    PyAudio sometimes reports no default input on Windows even when mics exist
-    under other host APIs (WASAPI etc.), so we scan everything ourselves.
-    """
-    p = pyaudio.PyAudio()
+def resolve_input_device(
+    selection: str = "",
+    audio_factory: Callable[[], pyaudio.PyAudio] = pyaudio.PyAudio,
+) -> int:
+    """Resolve an input device index from an index, name substring, or system default."""
+    p = audio_factory()
     try:
-        candidates: list[int] = []
+        devices: dict[int, str] = {}
         print("Available input devices:")
         for i in range(p.get_device_count()):
             info = p.get_device_info_by_index(i)
             if info["maxInputChannels"] > 0:
-                candidates.append(i)
+                devices[i] = info["name"]
                 print(f"  {i}: {info['name']} "
                       f"({info['maxInputChannels']} ch @ {int(info['defaultSampleRate'])} Hz)")
+
+        if not devices:
+            raise RuntimeError("No microphone found; connect or enable an input device")
+
+        selection = selection.strip()
+        if selection:
+            if selection.lstrip("-").isdigit():
+                index = int(selection)
+                if index not in devices:
+                    raise ValueError(
+                        f"INPUT_DEVICE={selection!r} is not an available input device"
+                    )
+                return index
+
+            needle = selection.casefold()
+            matches = [index for index, name in devices.items() if needle in name.casefold()]
+            if len(matches) == 1:
+                return matches[0]
+            if not matches:
+                raise ValueError(f"No input device name contains {selection!r}")
+            names = ", ".join(f"{index}: {devices[index]}" for index in matches)
+            raise ValueError(f"INPUT_DEVICE={selection!r} is ambiguous; matches: {names}")
+
         try:
-            return p.get_default_input_device_info()["index"]
-        except OSError:
-            if candidates:
-                return candidates[0]
-            raise RuntimeError(
-                "No microphone found - connect/enable one in Windows sound settings"
-            ) from None
+            default_index = int(p.get_default_input_device_info()["index"])
+            if default_index in devices:
+                return default_index
+        except (KeyError, OSError):
+            pass
+        return next(iter(devices))
     finally:
         p.terminate()
+
+
+def pick_input_device() -> int:
+    """Return the configured input device, system default, or first microphone."""
+    return resolve_input_device(os.getenv("INPUT_DEVICE", ""))
+
+
+def handle_transcript(text: str) -> None:
+    """Print the transcript and pass it to Jarvis without coupling STT imports to the agent."""
+    print(f"[final] {text}")
+    from agent import jarvis
+
+    print(jarvis.invoke({"messages": [{"role": "user", "content": text}]}))
 
 
 # ── Clap detection ────────────────────────────────────────────────────────────
@@ -79,15 +116,9 @@ def detect_double_clap(detector: ClapDetector, audio: np.ndarray) -> bool:
 def main() -> None:
     pygame.mixer.init()
 
-    # INPUT_DEVICE env var (index or name substring) overrides auto-detection
-    device_env = os.getenv("INPUT_DEVICE", "").strip()
-    if device_env:
-        input_device = int(device_env) if device_env.lstrip("-").isdigit() else device_env
-    else:
-        input_device = pick_input_device()
-
-    whisper = WhisperCpp()
-    print("[whisper.cpp server ready]")
+    input_device = pick_input_device()
+    transcriber = create_transcriber()
+    print(f"[transcription backend ready: {os.getenv('STT_BACKEND', 'whisper_cpp')}]")
 
     detector = ClapDetector(
         inputDevice=input_device,
@@ -96,7 +127,13 @@ def main() -> None:
         debounceTimeFactor=0.15,
         rate=None,                    # use the device's native rate
     )
-    detector.initAudio()
+    try:
+        detector.initAudio()
+    except Exception:
+        transcriber.close()
+        if hasattr(detector, "p"):
+            detector.p.terminate()
+        raise
     sample_rate: int = detector.rate
     channels: int = detector.p.get_device_info_by_index(detector.inputDevice)["maxInputChannels"]
     stt_chunk_bytes: int = int(sample_rate * STT_CHUNK_MS / 1000) * 2  # int16 mono
@@ -140,14 +177,14 @@ def main() -> None:
 
                 # First double-clap → wake
                 print("[Wake detected]")
-                pygame.mixer.music.load("should_i_stay_or_should_i_go.mp3")
+                pygame.mixer.music.load(str(WAKE_SOUND))
                 pygame.mixer.music.play()
 
                 audio_q = queue.Queue()        # fresh queue for this session
                 pcm_buffer = bytearray()
                 stt_thread = threading.Thread(
                     target=stream_transcribe,
-                    args=(audio_q, whisper, sample_rate),
+                    args=(audio_q, transcriber, sample_rate, handle_transcript),
                     daemon=True,
                 )
                 stt_thread.start()
@@ -171,8 +208,10 @@ def main() -> None:
             audio_q.put(None)
             if stt_thread is not None:
                 stt_thread.join()
-        whisper.close()
-        detector.stop()
+        try:
+            transcriber.close()
+        finally:
+            detector.stop()
 
 
 if __name__ == "__main__":

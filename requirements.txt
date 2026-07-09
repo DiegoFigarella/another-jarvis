@@ -6,4 +6,6 @@ pyaudio
 dotenv
 numpy
 langchain-anthropic
+langchain-openai
+openai
 requests

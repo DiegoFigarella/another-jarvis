@@ -1,8 +1,8 @@
-"""Thin wrapper around a local whisper.cpp server + pseudo-streaming transcription.
+"""Speech-to-text backends and pseudo-streaming transcription.
 
-whisper.cpp has no true streaming API over HTTP, so we do utterance-based
-pseudo-streaming: buffer mic audio, cut a segment when the speaker pauses
-(or the segment gets too long), and transcribe each segment as it closes.
+The listener buffers microphone audio, cuts a segment when the speaker pauses
+(or the segment gets too long), and sends each completed utterance to the
+configured backend. Both whisper.cpp and OpenAI use this same segmentation.
 """
 from __future__ import annotations
 
@@ -13,21 +13,47 @@ import subprocess
 import time
 import wave
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Protocol
 
 import numpy as np
 import requests
+from dotenv import load_dotenv
 
-from agent import jarvis
+load_dotenv()
 
 # ── whisper.cpp locations (override via env / .env) ──────────────────────────
-WHISPER_CPP_DIR = Path(
-    os.getenv("WHISPER_CPP_DIR", Path(__file__).resolve().parents[2] / "whispercpp" / "whisper.cpp")
+
+
+def _env_path(name: str, default: Path) -> Path:
+    value = os.getenv(name, "").strip()
+    return Path(value).expanduser() if value else default
+
+
+WHISPER_CPP_DIR = _env_path(
+    "WHISPER_CPP_DIR",
+    Path.home() / "whispercpp" / "whisper.cpp",
 )
-WHISPER_MODEL = Path(
-    os.getenv("WHISPER_MODEL", WHISPER_CPP_DIR / "models" / "ggml-base.en.bin")
+WHISPER_MODEL = _env_path(
+    "WHISPER_MODEL",
+    WHISPER_CPP_DIR / "models" / "ggml-base.en.bin",
 )
-SERVER_EXE = WHISPER_CPP_DIR / "build" / "bin" / "Release" / "whisper-server.exe"
+
+
+def _default_server_executable() -> Path:
+    override = os.getenv("WHISPER_SERVER", "").strip()
+    if override:
+        return Path(override).expanduser()
+
+    executable = "whisper-server.exe" if os.name == "nt" else "whisper-server"
+    candidates = (
+        WHISPER_CPP_DIR / "build" / "bin" / "Release" / executable,
+        WHISPER_CPP_DIR / "build" / "bin" / executable,
+        WHISPER_CPP_DIR / "build" / "bin" / "Debug" / executable,
+    )
+    return next((candidate for candidate in candidates if candidate.exists()), candidates[0])
+
+
+SERVER_EXE = _default_server_executable()
 
 # ── Segmentation tuning ───────────────────────────────────────────────────────
 MIN_SPEECH_RMS = 150       # ponytail: energy VAD with adaptive noise floor; swap in Silero VAD if it misfires
@@ -37,8 +63,33 @@ PREROLL_S = 0.5            # audio kept before speech starts, so first word isn'
 DEBUG = os.getenv("STT_DEBUG", "") not in ("", "0")  # set STT_DEBUG=1 to print per-chunk levels
 
 
+class Transcriber(Protocol):
+    """Minimal interface shared by local and hosted transcription backends."""
+
+    def transcribe(self, pcm: bytes, sample_rate: int) -> str: ...
+
+    def close(self) -> None: ...
+
+
+def _wav_buffer(pcm: bytes, sample_rate: int) -> io.BytesIO:
+    if not pcm:
+        raise ValueError("No audio was captured")
+    if sample_rate <= 0:
+        raise ValueError(f"Invalid sample rate: {sample_rate}")
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm)
+    buf.seek(0)
+    buf.name = "audio.wav"
+    return buf
+
+
 class WhisperCpp:
-    """Starts whisper-server.exe (model loaded once) and transcribes PCM chunks over HTTP."""
+    """Start whisper.cpp's HTTP server and transcribe PCM chunks locally."""
 
     def __init__(
         self,
@@ -78,13 +129,7 @@ class WhisperCpp:
 
     def transcribe(self, pcm: bytes, sample_rate: int) -> str:
         """Transcribe raw mono int16 PCM. The server resamples, so any rate works."""
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as wav:
-            wav.setnchannels(1)
-            wav.setsampwidth(2)
-            wav.setframerate(sample_rate)
-            wav.writeframes(pcm)
-        buf.seek(0)
+        buf = _wav_buffer(pcm, sample_rate)
 
         response = requests.post(
             self._url,
@@ -104,15 +149,77 @@ class WhisperCpp:
                 self._proc.kill()
 
 
+class OpenAIWhisper:
+    """Transcribe utterances with OpenAI's audio transcription API."""
+
+    def __init__(
+        self,
+        model: str | None = None,
+        prompt: str | None = None,
+        client: Any | None = None,
+    ) -> None:
+        if client is None:
+            try:
+                from openai import OpenAI
+            except ImportError as exc:
+                raise RuntimeError(
+                    "The OpenAI backend requires the 'openai' package. "
+                    "Run: pip install -r requirements.txt"
+                ) from exc
+            client = OpenAI()
+            self._owns_client = True
+        else:
+            self._owns_client = False
+
+        self._client = client
+        self._model = model or os.getenv("OPENAI_TRANSCRIPTION_MODEL", "whisper-1")
+        self._prompt = (
+            prompt
+            if prompt is not None
+            else os.getenv("OPENAI_TRANSCRIPTION_PROMPT", "WhatsApp. Send a text message to.")
+        )
+
+    def transcribe(self, pcm: bytes, sample_rate: int) -> str:
+        audio_file = _wav_buffer(pcm, sample_rate)
+        request: dict[str, Any] = {
+            "model": self._model,
+            "file": audio_file,
+        }
+        if self._prompt:
+            request["prompt"] = self._prompt
+
+        result = self._client.audio.transcriptions.create(**request)
+        text = result if isinstance(result, str) else getattr(result, "text", "")
+        return text.strip()
+
+    def close(self) -> None:
+        if self._owns_client:
+            self._client.close()
+
+
+def create_transcriber(backend: str | None = None) -> Transcriber:
+    """Create the backend selected by STT_BACKEND."""
+    configured = backend if backend is not None else os.getenv("STT_BACKEND")
+    selected = (configured or "whisper_cpp").strip().lower()
+    selected = selected.replace("-", "_").replace(".", "_")
+    if selected in {"whisper_cpp", "local"}:
+        return WhisperCpp()
+    if selected in {"openai", "openai_whisper"}:
+        return OpenAIWhisper()
+    raise ValueError(
+        f"Unknown STT_BACKEND {selected!r}; expected 'whisper_cpp' or 'openai'"
+    )
+
+
 def stream_transcribe(
     audio_q: queue.Queue[bytes | None],
-    whisper: WhisperCpp,
+    transcriber: Transcriber,
     sample_rate: int,
     on_text: Callable[[str], None] = lambda t: print(f"[final] {t}"),
 ) -> None:
     """
     Runs in its own thread. Reads raw int16 PCM chunks from *audio_q*,
-    segments them on silence, and transcribes each utterance with whisper.cpp.
+    segments them on silence, and transcribes each utterance with the selected backend.
     Exits when it receives the None sentinel from the queue.
     """
     buf = bytearray()
@@ -126,14 +233,15 @@ def stream_transcribe(
         nonlocal buf, silence_ms, in_speech
         if in_speech:
             try:
-                text = whisper.transcribe(bytes(buf), sample_rate)
-                if text:
-                    on_text(text)
-                    print(jarvis.invoke({
-                        "messages": [{"role": "user", "content": text}]
-                    }))
-            except requests.RequestException as exc:
-                print(f"[whisper error: {exc}]")
+                text = transcriber.transcribe(bytes(buf), sample_rate)
+            except Exception as exc:  # noqa: BLE001 - backend errors should not kill audio capture
+                print(f"[transcription error: {exc}]")
+            else:
+                try:
+                    if text:
+                        on_text(text)
+                except Exception as exc:  # noqa: BLE001 - keep listening after agent errors
+                    print(f"[assistant error: {exc}]")
         buf = bytearray()
         silence_ms = 0.0
         in_speech = False

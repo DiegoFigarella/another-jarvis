@@ -18,6 +18,8 @@ from typing import Callable
 import numpy as np
 import requests
 
+from agent import jarvis
+
 # ── whisper.cpp locations (override via env / .env) ──────────────────────────
 WHISPER_CPP_DIR = Path(
     os.getenv("WHISPER_CPP_DIR", Path(__file__).resolve().parents[2] / "whispercpp" / "whisper.cpp")
@@ -127,6 +129,9 @@ def stream_transcribe(
                 text = whisper.transcribe(bytes(buf), sample_rate)
                 if text:
                     on_text(text)
+                    print(jarvis.invoke({
+                        "messages": [{"role": "user", "content": text}]
+                    }))
             except requests.RequestException as exc:
                 print(f"[whisper error: {exc}]")
         buf = bytearray()

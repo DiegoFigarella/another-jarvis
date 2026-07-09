@@ -1,88 +1,131 @@
 # another-jarvis
 
-Voice assistant: double-clap to wake, speak, and your words are transcribed
-locally with [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (no cloud
-STT). A second double-clap stops the session.
+A hands-free WhatsApp assistant. Double-clap to wake it, speak, and double-clap
+again to finish the session. Audio can be transcribed by either a local
+[whisper.cpp](https://github.com/ggml-org/whisper.cpp) server or OpenAI's hosted
+Whisper API.
 
 ## How it works
 
-```
-mic ─▶ listener.py ─▶ double clap? ─▶ start session
-              │
-              ▶ audio chunks ─▶ whisper_stt.stream_transcribe (thread)
-                                      │  buffers audio, cuts a segment when
-                                      │  you pause (~0.8 s) or after 15 s
-                                      ▼
-                               whisper-server.exe (local HTTP, model loaded once)
-                                      │
-                                      ▼
-                               [final] transcript printed per utterance
+```text
+microphone -> listener.py -> double clap -> utterance segmentation
+                                      -> whisper.cpp or OpenAI Whisper
+                                      -> LangChain agent -> Evolution API
 ```
 
-whisper.cpp has no true streaming API, so this is utterance-based
-pseudo-streaming: you get a transcript a moment after each pause instead of
-word-by-word interim results. Latency per utterance ≈ pause detection (~1 s)
-plus inference (well under a second for `base.en` on CPU).
+Transcription is utterance-based: the listener sends a segment after about 0.8
+seconds of silence or after 15 seconds of continuous speech.
 
 ## Setup
 
-### 1. Build whisper.cpp (one-time)
+### 1. Install Python dependencies
 
-The whisper.cpp clone is expected at `..\..\whispercpp\whisper.cpp` relative
-to this folder (override with the `WHISPER_CPP_DIR` env var). Build the server:
+Create a virtual environment, then install the requirements:
 
-```powershell
-cd ..\..\whispercpp\whisper.cpp
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+On Windows, activate with `.venv\Scripts\activate` instead. On macOS, if PyAudio
+cannot build, install PortAudio first with `brew install portaudio` and retry.
+
+### 2. Configure the environment
+
+```bash
+cp .env.example .env
+```
+
+Fill in the Evolution API values and the LangChain model provider key. The
+included example uses an OpenAI model, so `OPENAI_API_KEY` covers both the agent
+and OpenAI transcription.
+
+### 3. Choose a transcription backend
+
+For hosted OpenAI Whisper, set:
+
+```dotenv
+STT_BACKEND=openai
+OPENAI_API_KEY=your-key
+OPENAI_TRANSCRIPTION_MODEL=whisper-1
+```
+
+For fully local transcription, set `STT_BACKEND=whisper_cpp`, clone
+whisper.cpp, and build the server:
+
+```bash
+git clone https://github.com/ggml-org/whisper.cpp
+cd whisper.cpp
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release --target whisper-server
 ```
 
-> **Antivirus note:** AVG/Avast tend to flag the freshly built
-> `whisper-server.exe` as `IDP.Generic` — a false positive on new unsigned
-> binaries. If that happens, restore it from quarantine and add an exclusion
-> for the `whispercpp` folder, then rebuild.
+Download a model from the whisper.cpp repository, then configure its paths:
 
-### 2. Model
-
-`models/ggml-base.en.bin` is already in the whisper.cpp clone. To use another
-model, download it with `models\download-ggml-model.cmd <name>` and set
-`WHISPER_MODEL` to its path.
-
-### 3. Python deps
-
-```powershell
-pip install -r requirements.txt
+```dotenv
+STT_BACKEND=whisper_cpp
+WHISPER_CPP_DIR=/absolute/path/to/whisper.cpp
+WHISPER_MODEL=/absolute/path/to/whisper.cpp/models/ggml-base.en.bin
 ```
+
+The server executable is detected in the usual CMake output directories on
+macOS, Linux, and Windows. Set `WHISPER_SERVER` only for a custom location.
+
+## macOS microphone setup
+
+Grant microphone access to the terminal or app running Jarvis under **System
+Settings > Privacy & Security > Microphone**.
+
+The listener uses the system default microphone. To override it, set
+`INPUT_DEVICE` to either an index or a case-insensitive name substring:
+
+```dotenv
+INPUT_DEVICE=0
+# or
+INPUT_DEVICE=MacBook Pro Microphone
+```
+
+Available input devices are printed at startup. Speaker-only devices are
+excluded and invalid selections fail with a specific error.
 
 ## Run
 
-```powershell
+```bash
 python listener.py
 ```
 
-- **Double clap** → wake sound plays, transcription session starts.
-- Speak; each time you pause, a `[final] ...` line is printed.
-- **Double clap again** → session stops and the program exits.
+- First double-clap: start listening.
+- Speak normally; pauses close individual utterances.
+- Second double-clap: flush the final utterance and exit.
+
+The wake sound and transcription run concurrently. Headphones avoid the wake
+sound being picked up by the microphone.
 
 ## Configuration
 
-| What | Where | Default |
-|------|-------|---------|
-| whisper.cpp repo path | `WHISPER_CPP_DIR` env var | `..\..\whispercpp\whisper.cpp` |
-| Model file | `WHISPER_MODEL` env var | `models/ggml-base.en.bin` in the repo |
-| Speech threshold (mic sensitivity) | `MIN_SPEECH_RMS` in [whisper_stt.py](whisper_stt.py); adapts to ambient noise on top of this floor | 150 |
-| Per-chunk level debugging | `STT_DEBUG=1` env var | off |
-| Pause length that ends an utterance | `SILENCE_HANG_MS` in [whisper_stt.py](whisper_stt.py) | 800 ms |
-| Input device | `INPUT_DEVICE` env var: device index (e.g. `5`) or name substring (e.g. `Buds2`) | empty → auto (system default mic) |
-| Sample rate | auto: the chosen device's native rate | — |
+| Variable | Default | Purpose |
+|---|---|---|
+| `STT_BACKEND` | `whisper_cpp` | `whisper_cpp` or `openai` |
+| `INPUT_DEVICE` | system default | Input index or name substring |
+| `OPENAI_TRANSCRIPTION_MODEL` | `whisper-1` | OpenAI transcription model |
+| `OPENAI_TRANSCRIPTION_PROMPT` | WhatsApp phrase hints | Optional vocabulary hint |
+| `WHISPER_CPP_DIR` | `~/whispercpp/whisper.cpp` | Local whisper.cpp checkout |
+| `WHISPER_MODEL` | `models/ggml-base.en.bin` | Local model path |
+| `WHISPER_SERVER` | auto-detected | Local server executable |
+| `STT_DEBUG` | off | Set to `1` for per-chunk audio levels |
 
-## Smoke test
+## Tests
 
-Transcribes whisper.cpp's bundled `jfk.wav` through the full
-server-start → HTTP → transcript pipeline:
+The unit tests use fake audio and API clients, so they do not need a microphone,
+OpenAI request, or running Evolution API:
 
-```powershell
-python whisper_stt.py
+```bash
+python -m unittest
 ```
 
-Prints the JFK quote and `OK` on success.
+To smoke-test the local whisper.cpp server with its bundled `jfk.wav` sample:
+
+```bash
+STT_BACKEND=whisper_cpp python whisper_stt.py
+```

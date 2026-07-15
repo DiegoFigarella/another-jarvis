@@ -9,3 +9,4 @@ langchain-anthropic
 langchain-openai
 openai
 requests
+browser-use

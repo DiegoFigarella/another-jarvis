@@ -184,6 +184,7 @@ class OpenAIWhisper:
         request: dict[str, Any] = {
             "model": self._model,
             "file": audio_file,
+            "language": "auto",
         }
         if self._prompt:
             request["prompt"] = self._prompt
